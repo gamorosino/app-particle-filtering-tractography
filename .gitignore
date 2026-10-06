@@ -1,0 +1,10 @@
+# brainlife.io runtime -- written by the orchestrator, never commit the real one
+config.json
+
+# app working/output directories
+work_pft/
+tractogram/
+
+# Byte-compiled files
+__pycache__/
+*.py[cod]

@@ -1,0 +1,233 @@
+#!/bin/bash
+
+#SBATCH --job-name=pft-tracking
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=8G
+#SBATCH --time=4:00:00
+
+# Particle Filtering Tractography (PFT) -- brainlife.io app.
+#
+# Runs scil_tracking_pft.py (scilpy, inside scilus:1.6.0) given an FODF
+# volume and a 5-tissue-type (5TT) probability map.  PFT maps are derived
+# from the 5TT using the standard brainlife neuro/mask 5tt volume ordering:
+#
+#   vol0 = cortical GM
+#   vol1 = subcortical GM
+#   vol2 = WM / brainstem
+#   vol3 = CSF / ventricles
+#   vol4 = pathological tissue
+#
+# map_include = vol0 + vol1 (all GM probability, clamped to [0,1])
+# map_exclude = vol3 (CSF probability)
+# seed_mask   = binarize(vol2) (WM mask) unless overridden via config
+#
+# Output: tractogram/track.tck
+
+set -euo pipefail
+trap 'echo "ERROR: command failed at line $LINENO (exit $?) -- cmd: $BASH_COMMAND" >&2' ERR
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${REPO_DIR}/code/scripts/utils/qc_json.sh"
+
+TASK_DIR="$(pwd)"
+SCILUS_IMAGE="docker://scilus/scilus:1.6.0"
+
+# ---------------------------------------------------------------------------
+# Read config.json
+# ---------------------------------------------------------------------------
+CONFIG="${CONFIG:-config.json}"
+[[ -f "$CONFIG" ]] || { echo "ERROR: config not found: $CONFIG"; exit 1; }
+
+fodf=$(jq -r '.fodf' "$CONFIG")
+mask_5tt=$(jq -r '.mask_5tt' "$CONFIG")
+seed_mask_in=$(jq -r '.seed_mask // empty' "$CONFIG")
+
+algo=$(jq -r '.algo // "prob"' "$CONFIG")
+seeding_type=$(jq -r '.seeding_type // "npv"' "$CONFIG")
+nbr_seeds=$(jq -r '.nbr_seeds // 10' "$CONFIG")
+step=$(jq -r '.step // 0.5' "$CONFIG")
+theta=$(jq -r '.theta // 20' "$CONFIG")
+sfthres=$(jq -r '.sfthres // 0.1' "$CONFIG")
+sfthres_init=$(jq -r '.sfthres_init // 0.5' "$CONFIG")
+min_length=$(jq -r '.min_length // 20' "$CONFIG")
+max_length=$(jq -r '.max_length // 200' "$CONFIG")
+particles=$(jq -r '.particles // 15' "$CONFIG")
+back_tracking=$(jq -r '.back_tracking // 2' "$CONFIG")
+forward_tracking=$(jq -r '.forward_tracking // 1' "$CONFIG")
+compress=$(jq -r '.compress // true' "$CONFIG")
+compress_value=$(jq -r '.compress_value // 0.2' "$CONFIG")
+random_seed=$(jq -r '.random_seed // 0' "$CONFIG")
+sh_basis=$(jq -r '.sh_basis // "descoteaux07"' "$CONFIG")
+
+[[ -f "$fodf" ]] || { echo "ERROR: fodf not found: $fodf"; exit 1; }
+[[ -f "$mask_5tt" ]] || { echo "ERROR: mask_5tt not found: $mask_5tt"; exit 1; }
+[[ -z "$seed_mask_in" ]] || [[ -f "$seed_mask_in" ]] \
+    || { echo "ERROR: seed_mask not found: $seed_mask_in"; exit 1; }
+
+if [[ "$seeding_type" != "npv" && "$seeding_type" != "nt" ]]; then
+    echo "ERROR: seeding_type must be 'npv' or 'nt', got: $seeding_type"; exit 1
+fi
+if [[ "$algo" != "prob" && "$algo" != "det" ]]; then
+    echo "ERROR: algo must be 'prob' or 'det', got: $algo"; exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Container helper
+#
+# EXTRA_BINDS collects --bind flags for every filesystem mount point that
+# holds an input path, so the container sees paths on non-default mounts
+# (e.g. sshfs, secondary disks).  Singularity is invoked with `cd /` to
+# avoid "Permission denied" on FUSE-mounted cwds.
+# ---------------------------------------------------------------------------
+EXTRA_BINDS=()
+declare -A _BIND_SEEN=()
+add_bind_for() {
+    local target="$1"
+    [[ -n "${target}" ]] || return 0
+    local resolved mount_point
+    resolved="$(readlink -f "${target}" 2>/dev/null || echo "${target}")"
+    mount_point="$(df --output=target -- "${resolved}" 2>/dev/null | tail -n1 | xargs || true)"
+    [[ -n "${mount_point}" && "${mount_point}" != "/" ]] || return 0
+    if [[ -z "${_BIND_SEEN[${mount_point}]:-}" ]]; then
+        _BIND_SEEN["${mount_point}"]=1
+        EXTRA_BINDS+=(--bind "${mount_point}:${mount_point}")
+    fi
+}
+for _p in "$TASK_DIR" "$fodf" "$mask_5tt" "$seed_mask_in"; do
+    add_bind_for "$_p"
+done
+
+scilus_exec() {
+    local host_pwd; host_pwd="$(pwd)"
+    ( cd / && singularity exec --cleanenv --pwd "${host_pwd}" "${EXTRA_BINDS[@]}" "$SCILUS_IMAGE" "$@" ) \
+        2> >(grep -Ev '^(INFO|WARNING):' >&2)
+}
+
+# ---------------------------------------------------------------------------
+# Working directory
+# ---------------------------------------------------------------------------
+work_dir="${TASK_DIR}/work_pft"
+mkdir -p "$work_dir"
+
+qc_json="${TASK_DIR}/qc.json"
+qc_init "$qc_json"
+trap 'qc_finalize "$qc_json"' EXIT
+
+# ---------------------------------------------------------------------------
+# 1. Extract PFT maps from 5TT
+#    include = cortical-GM (vol0) + subcortical-GM (vol1), clamped to [0,1]
+#    exclude = CSF (vol3)
+# ---------------------------------------------------------------------------
+map_include="${work_dir}/map_include.nii.gz"
+map_exclude="${work_dir}/map_exclude.nii.gz"
+echo "=== Extracting PFT maps from 5TT ==="
+scilus_exec python3 - "$mask_5tt" "$map_include" "$map_exclude" <<'PYEOF'
+import sys, numpy as np, nibabel as nib
+img = nib.load(sys.argv[1])
+d = img.get_fdata(dtype=np.float32)
+include = np.clip(d[..., 0] + d[..., 1], 0.0, 1.0)
+exclude = np.squeeze(d[..., 3])
+include = np.squeeze(include)
+hdr = img.header.copy()
+nib.save(nib.Nifti1Image(include, img.affine, hdr), sys.argv[2])
+nib.save(nib.Nifti1Image(exclude, img.affine, hdr), sys.argv[3])
+PYEOF
+qc_maps_timestamp=$(qc_timestamp)
+
+# ---------------------------------------------------------------------------
+# 2. Seeding mask (WM from 5TT vol2, or user-provided override)
+# ---------------------------------------------------------------------------
+seed_mask="${work_dir}/seed_mask.nii.gz"
+if [[ -n "$seed_mask_in" ]]; then
+    echo "=== Using provided seeding mask ==="
+    cp "$seed_mask_in" "$seed_mask"
+    qc_seed_status="provided"
+else
+    echo "=== Building WM seeding mask from 5TT (vol2) ==="
+    scilus_exec python3 - "$mask_5tt" "$seed_mask" <<'PYEOF'
+import sys, numpy as np, nibabel as nib
+img = nib.load(sys.argv[1])
+d = img.get_fdata(dtype=np.float32)
+wm = np.squeeze((d[..., 2] > 0).astype(np.uint8))
+hdr = img.header.copy()
+out = nib.Nifti1Image(wm, img.affine, hdr)
+out.set_data_dtype(np.uint8)
+nib.save(out, sys.argv[2])
+PYEOF
+    qc_seed_status="computed_from_wm"
+fi
+qc_seed_timestamp=$(qc_timestamp)
+
+# ---------------------------------------------------------------------------
+# 3. Detect scilpy PFT script name (renamed across scilpy versions)
+# ---------------------------------------------------------------------------
+pft_cmd=$(scilus_exec bash -c \
+    'command -v scil_tracking_pft.py 2>/dev/null || command -v scil_compute_pft.py 2>/dev/null || true')
+pft_cmd="${pft_cmd%$'\r'}"   # strip carriage return if any
+[[ -n "$pft_cmd" ]] \
+    || { echo "ERROR: neither scil_tracking_pft.py nor scil_compute_pft.py found in $SCILUS_IMAGE"; exit 1; }
+echo "  PFT command: $pft_cmd"
+
+# ---------------------------------------------------------------------------
+# 4. Run Particle Filtering Tractography
+# ---------------------------------------------------------------------------
+out_tractogram="${work_dir}/track.tck"
+echo "=== Running PFT (${algo}, ${seeding_type}=${nbr_seeds}, step=${step}, theta=${theta}) ==="
+
+compress_args=()
+[[ "$compress" == "true" ]] && compress_args=(--compress "$compress_value")
+
+scilus_exec "$pft_cmd" \
+    "$fodf" "$seed_mask" "$map_include" "$map_exclude" \
+    "$out_tractogram" \
+    --algo "$algo" \
+    "--${seeding_type}" "$nbr_seeds" \
+    --step "$step" \
+    --theta "$theta" \
+    --sfthres "$sfthres" \
+    --sfthres_init "$sfthres_init" \
+    --min_length "$min_length" \
+    --max_length "$max_length" \
+    --particles "$particles" \
+    --back "$back_tracking" \
+    --forward "$forward_tracking" \
+    "${compress_args[@]}" \
+    --sh_basis "$sh_basis" \
+    --seed "$random_seed"
+
+qc_track_timestamp=$(qc_timestamp)
+
+# ---------------------------------------------------------------------------
+# 5. Output
+# ---------------------------------------------------------------------------
+[[ -f "$out_tractogram" ]] || { echo "ERROR: no tractogram produced at $out_tractogram"; exit 1; }
+mkdir -p tractogram
+cp "$out_tractogram" tractogram/track.tck
+
+qc_write "$qc_json" "$(cat <<EOF
+"pft_tracking": {
+    "algo": "${algo}",
+    "seeding_type": "${seeding_type}",
+    "nbr_seeds": ${nbr_seeds},
+    "step": ${step},
+    "theta": ${theta},
+    "sfthres": ${sfthres},
+    "sfthres_init": ${sfthres_init},
+    "min_length": ${min_length},
+    "max_length": ${max_length},
+    "particles": ${particles},
+    "back_tracking": ${back_tracking},
+    "forward_tracking": ${forward_tracking},
+    "compress": ${compress},
+    "random_seed": ${random_seed},
+    "sh_basis": "${sh_basis}",
+    "seed_mask_source": "${qc_seed_status}",
+    "maps_timestamp": "${qc_maps_timestamp}",
+    "seed_timestamp": "${qc_seed_timestamp}",
+    "track_timestamp": "${qc_track_timestamp}"
+}
+EOF
+)"
+
+echo "=== Done: tractogram/track.tck ==="

@@ -1,0 +1,126 @@
+{
+  "name": "pft-particle-filtering-tractography",
+  "github": "gamorosino/app-particle-filtering-tractography",
+  "github_branch": "main",
+  "desc": "Particle Filtering Tractography (PFT): probabilistic or deterministic whole-brain tractography using scilpy's scil_tracking_pft.py. PFT maps (include/exclude) and seeding mask are derived automatically from a 5-tissue-type (5TT) segmentation.",
+  "config": {
+    "fodf": { "type": "input", "file_id": "lmax8", "input_id": "fodf" },
+    "mask_5tt": { "type": "input", "file_id": "mask", "input_id": "mask_5tt" },
+    "seed_mask": { "type": "input", "file_id": "mask", "input_id": "seed_mask" },
+    "algo": {
+      "id": "algo", "type": "string", "placeholder": "prob",
+      "desc": "Tracking algorithm: 'prob' (probabilistic) or 'det' (deterministic).",
+      "default": "prob"
+    },
+    "seeding_type": {
+      "id": "seeding_type", "type": "string", "placeholder": "npv",
+      "advanced": true, "desc": "Seeding strategy: 'npv' (seeds per voxel) or 'nt' (total seeds).",
+      "default": "npv"
+    },
+    "nbr_seeds": {
+      "id": "nbr_seeds", "type": "number", "placeholder": 10,
+      "desc": "Number of seeds (per voxel when seeding_type=npv, total when seeding_type=nt).",
+      "default": 10
+    },
+    "step": {
+      "id": "step", "type": "number", "placeholder": 0.5,
+      "advanced": true, "desc": "Step size in mm.",
+      "default": 0.5
+    },
+    "theta": {
+      "id": "theta", "type": "number", "placeholder": 20,
+      "advanced": true, "desc": "Maximum angle between consecutive steps (degrees).",
+      "default": 20
+    },
+    "sfthres": {
+      "id": "sfthres", "type": "number", "placeholder": 0.1,
+      "advanced": true, "desc": "Spherical function threshold for tractography.",
+      "default": 0.1
+    },
+    "sfthres_init": {
+      "id": "sfthres_init", "type": "number", "placeholder": 0.5,
+      "advanced": true, "desc": "Spherical function threshold for seeding initialization.",
+      "default": 0.5
+    },
+    "min_length": {
+      "id": "min_length", "type": "number", "placeholder": 20,
+      "advanced": true, "desc": "Minimum streamline length in mm.",
+      "default": 20
+    },
+    "max_length": {
+      "id": "max_length", "type": "number", "placeholder": 200,
+      "advanced": true, "desc": "Maximum streamline length in mm.",
+      "default": 200
+    },
+    "particles": {
+      "id": "particles", "type": "number", "placeholder": 15,
+      "advanced": true, "desc": "Number of PFT particles for back-tracking.",
+      "default": 15
+    },
+    "back_tracking": {
+      "id": "back_tracking", "type": "number", "placeholder": 2,
+      "advanced": true, "desc": "Back-tracking steps when a streamline enters an excluded region.",
+      "default": 2
+    },
+    "forward_tracking": {
+      "id": "forward_tracking", "type": "number", "placeholder": 1,
+      "advanced": true, "desc": "Forward-tracking steps after PFT back-tracking.",
+      "default": 1
+    },
+    "compress": {
+      "id": "compress", "type": "boolean",
+      "advanced": true, "desc": "Compress output streamlines to reduce file size.",
+      "default": true
+    },
+    "compress_value": {
+      "id": "compress_value", "type": "number", "placeholder": 0.2,
+      "advanced": true, "desc": "Maximum compression error in mm (used when compress=true).",
+      "default": 0.2
+    },
+    "random_seed": {
+      "id": "random_seed", "type": "number", "placeholder": 0,
+      "advanced": true, "desc": "Random seed for reproducibility.",
+      "default": 0
+    },
+    "sh_basis": {
+      "id": "sh_basis", "type": "string", "placeholder": "descoteaux07",
+      "advanced": true, "desc": "Spherical harmonics basis: 'descoteaux07' or 'tournier07'.",
+      "default": "descoteaux07"
+    }
+  },
+  "inputs": [
+    {
+      "id": "fodf",
+      "datatype": "neuro/csd",
+      "datatype_tags": [],
+      "optional": false,
+      "multi": false,
+      "advanced": false
+    },
+    {
+      "id": "mask_5tt",
+      "datatype": "neuro/mask",
+      "datatype_tags": ["5tt"],
+      "optional": false,
+      "multi": false,
+      "advanced": false
+    },
+    {
+      "id": "seed_mask",
+      "datatype": "neuro/mask",
+      "datatype_tags": [],
+      "optional": true,
+      "multi": false,
+      "advanced": true
+    }
+  ],
+  "outputs": [
+    {
+      "id": "tractogram",
+      "desc": "Whole-brain tractogram produced by Particle Filtering Tractography.",
+      "datatype": "neuro/track/tck",
+      "datatype_tags": [],
+      "archive": true
+    }
+  ]
+}
