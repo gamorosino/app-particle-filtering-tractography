@@ -1,5 +1,5 @@
 {
-  "name": "pft-particle-filtering-tractography",
+  "name": "Particle Filtering Tractography (PFT)",
   "github": "gamorosino/app-particle-filtering-tractography",
   "github_branch": "main",
   "desc": "Particle Filtering Tractography (PFT): probabilistic or deterministic whole-brain tractography using scilpy's scil_tracking_pft.py. PFT maps (include/exclude) and seeding mask are derived automatically from a 5-tissue-type (5TT) segmentation.",
